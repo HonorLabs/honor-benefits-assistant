@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
+    "mammoth": "^1.8.0",
     "pg": "^8.22.0"
   }
 }
