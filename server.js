@@ -3,13 +3,16 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import pg from "pg";
+import mammoth from "mammoth";
 import { buildSystemPrompt } from "./prompt.js";
 import { loadPackages, assembleKnowledge, isEnabled, packageSummaries } from "./packages.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+// Raised from 1mb so /brain can accept uploaded PDFs/images/docs as base64.
+// Chat bodies stay tiny; this is just a ceiling.
+app.use(express.json({ limit: "30mb" }));
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
@@ -28,10 +31,35 @@ const PRICE_OUT_PER_MTOK = parseFloat(process.env.PRICE_OUT_PER_MTOK || "15.00")
 // turning a package on/off is live from /admin (no redeploy) and persists in
 // the package_state table. If packages/ is empty, we fall back to the legacy
 // single knowledge-base.md so the assistant never goes dark.
+//
+// On top of packages there are "brain entries" — knowledge added live through
+// the /brain page. Those are stored in Postgres and appended to the knowledge
+// base with no redeploy, so HR can teach Benny new facts on the fly.
 const PACKAGES_DIR = path.join(__dirname, "packages");
 let PACKAGES = loadPackages(PACKAGES_DIR);
 let packageState = {}; // id -> boolean; loaded from the DB at startup
+let brainEntries = []; // live /brain additions, newest first; loaded from the DB
 let SYSTEM_PROMPT = "";
+
+// Render the live /brain additions as a knowledge-base section. Newest first,
+// and flagged as the most current, authoritative source so Benny prefers them.
+function renderBrainEntries() {
+  if (!brainEntries.length) return "";
+  let out =
+    "\n\n=====================================================================\n" +
+    "# LIVE ADDITIONS — taught directly through /brain (newest first)\n" +
+    "# These are the most current facts available. Treat them as authoritative.\n" +
+    "# If a live addition conflicts with older text above, follow the live\n" +
+    "# addition. If two live additions conflict, follow the one listed first\n" +
+    "# (it was added more recently).\n" +
+    "=====================================================================\n";
+  for (const e of brainEntries) {
+    const d = e.created_at instanceof Date ? e.created_at : new Date(e.created_at);
+    const when = isNaN(d) ? "" : ` (added ${d.toISOString().slice(0, 10)})`;
+    out += `\n## ${e.title}${when}\n${e.body}\n`;
+  }
+  return out;
+}
 
 function rebuildSystemPrompt() {
   let kb = "";
@@ -45,6 +73,7 @@ function rebuildSystemPrompt() {
       console.warn("No packages and no knowledge-base.md:", e.message);
     }
   }
+  kb += renderBrainEntries();
   SYSTEM_PROMPT = buildSystemPrompt(kb);
   return SYSTEM_PROMPT;
 }
@@ -66,7 +95,7 @@ if (process.env.DATABASE_URL) {
   });
   initDb();
 } else {
-  console.warn("DATABASE_URL not set — question logging and /admin are disabled.");
+  console.warn("DATABASE_URL not set — question logging, /admin, and /brain are disabled.");
 }
 
 async function initDb() {
@@ -98,9 +127,28 @@ async function initDb() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+    // Live knowledge added through /brain. Appended to the system prompt with
+    // no redeploy; deletable from the /brain Logs tab.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS brain_entries (
+        id SERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        title TEXT NOT NULL,
+        summary TEXT,
+        body TEXT NOT NULL,
+        source_kind TEXT,
+        source_name TEXT,
+        enabled BOOLEAN NOT NULL DEFAULT true
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS brain_entries_created_at_idx ON brain_entries (created_at);`);
     dbReady = true;
     await loadPackageState();
-    console.log("Question log and package state are ready.");
+    await loadBrainEntries();
+    rebuildSystemPrompt();
+    console.log(
+      `Question log, package state, and ${brainEntries.length} brain entr${brainEntries.length === 1 ? "y" : "ies"} are ready.`
+    );
   } catch (e) {
     console.error("Could not initialize the database tables:", e.message);
   }
@@ -118,6 +166,23 @@ async function loadPackageState() {
     console.log(`Applied saved state for ${rows.length} package(s).`);
   } catch (e) {
     console.error("Could not load package state:", e.message);
+  }
+}
+
+// Load the live /brain additions into memory (newest first) for the prompt.
+async function loadBrainEntries() {
+  if (!pool || !dbReady) {
+    brainEntries = [];
+    return;
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, created_at, title, body FROM brain_entries
+       WHERE enabled = true ORDER BY created_at DESC`
+    );
+    brainEntries = rows;
+  } catch (e) {
+    console.error("Could not load brain entries:", e.message);
   }
 }
 
@@ -536,11 +601,241 @@ app.post("/api/admin/packages/:id", adminAuth, async (req, res) => {
   res.json({ ok: true, id: pkg.id, enabled, persisted });
 });
 
+// --- Brain (teach Benny live) ----------------------------------------------
+// The /brain page lets HR add knowledge without a redeploy. It accepts typed
+// text and/or uploaded files (PDF, Word .docx, images/scans, plain text). An
+// "intake agent" turns the material into one clean knowledge entry, saves it to
+// brain_entries, rebuilds the prompt, and then asks the live Benny a test
+// question so the person can see the new fact took effect. Same admin password.
+
+const INGEST_SYSTEM = `You are the knowledge intake agent for "Benny," a benefits and 401(k) assistant used by Honor Health Network employees. Someone from HR or operations is giving you material — typed notes, a PDF, a Word document, or an image/scan. Your ONLY job is to turn that material into ONE clean knowledge entry that Benny can use to answer employees, and to write a question that proves the entry works.
+
+Rules for the entry body:
+- Capture the concrete facts an employee would need: dollar amounts, percentages, dates, deadlines, plan names, eligibility rules, phone numbers, emails, and links. Do not lose specifics.
+- If the material clearly applies to a specific agency, plan, or group, say so explicitly (e.g., "For Family Care employees, ...").
+- Write the body as clean reference knowledge in Markdown — short headings and bullets are good. It is NOT a chat reply: no greetings, no "Benny will…", no first person.
+- Do not invent anything. Include only what the material supports. Ignore page numbers, boilerplate, and legal filler.
+- Keep it focused. If the material is long, distill the benefits-relevant parts.
+
+Then write "test_question": a realistic, SELF-CONTAINED question an employee might ask that this new entry now answers. Make it specific enough to answer without a follow-up — if the entry is agency- or plan-specific, name that agency/plan in the question.
+
+Respond with ONLY a JSON object — no code fences, no commentary:
+{"title": "short label", "summary": "one short line for a log list", "body": "the Markdown knowledge", "test_question": "..."}
+
+If the material contains nothing useful for a benefits assistant, respond with exactly:
+{"title": "", "summary": "", "body": "", "test_question": ""}`;
+
+function guessMediaType(name, mt) {
+  if (mt) return mt;
+  const n = String(name).toLowerCase();
+  if (n.endsWith(".png")) return "image/png";
+  if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
+  if (n.endsWith(".webp")) return "image/webp";
+  if (n.endsWith(".gif")) return "image/gif";
+  if (n.endsWith(".pdf")) return "application/pdf";
+  return "";
+}
+
+function extractJson(text) {
+  let t = String(text).trim();
+  t = t.replace(/^```(?:json)?/i, "").replace(/```$/g, "").trim();
+  const a = t.indexOf("{");
+  const b = t.lastIndexOf("}");
+  if (a !== -1 && b !== -1 && b > a) t = t.slice(a, b + 1);
+  return JSON.parse(t);
+}
+
+// Ask the live Benny a single question with the current system prompt. Used to
+// prove a freshly added entry took effect.
+async function askBenny(question) {
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": API_KEY, "anthropic-version": "2023-06-01" },
+    body: JSON.stringify({
+      model: MODEL,
+      max_tokens: 1024,
+      system: [{ type: "text", text: SYSTEM_PROMPT }],
+      messages: [{ role: "user", content: String(question).slice(0, 2000) }],
+    }),
+  });
+  if (!r.ok) throw new Error("benny " + r.status);
+  const d = await r.json();
+  const raw = (d.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+  return parseAndStripTag(raw).clean || raw;
+}
+
+app.get("/brain", adminAuth, (_req, res) => {
+  res.sendFile(path.join(__dirname, "brain-page.html"));
+});
+
+// Add knowledge. Body: { text?: string, files?: [{name, mediaType, dataBase64}] }
+app.post("/api/brain/ingest", adminAuth, async (req, res) => {
+  if (!API_KEY) return res.status(500).json({ error: "The assistant isn't configured yet (no API key)." });
+  if (!pool || !dbReady) {
+    return res.status(503).json({ error: "The database isn't connected, so I can't save to Benny's brain yet." });
+  }
+
+  const { text, files } = req.body || {};
+  const hasText = typeof text === "string" && text.trim().length > 0;
+  const fileList = Array.isArray(files) ? files.slice(0, 8) : [];
+  if (!hasText && fileList.length === 0) {
+    return res.status(400).json({ error: "Add some text or a file first." });
+  }
+
+  const blocks = [];
+  let sourceKind = null;
+  const names = [];
+
+  if (hasText) {
+    blocks.push({ type: "text", text: "Typed notes:\n\n" + text.slice(0, 60000) });
+    sourceKind = "text";
+    names.push("typed notes");
+  }
+
+  try {
+    for (const f of fileList) {
+      const name = String(f?.name || "file");
+      const b64 = String(f?.dataBase64 || "");
+      if (!b64) continue;
+      if (b64.length > 28_000_000) {
+        return res.status(413).json({ error: `"${name}" is too large. Please keep files under about 20 MB.` });
+      }
+      const mt = guessMediaType(name, String(f?.mediaType || ""));
+      const lower = name.toLowerCase();
+
+      if (mt === "application/pdf" || lower.endsWith(".pdf")) {
+        blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } });
+        sourceKind = sourceKind || "pdf";
+      } else if (mt.startsWith("image/")) {
+        blocks.push({ type: "image", source: { type: "base64", media_type: mt, data: b64 } });
+        sourceKind = sourceKind || "image";
+      } else if (lower.endsWith(".docx") || mt.includes("wordprocessingml")) {
+        const buffer = Buffer.from(b64, "base64");
+        const { value } = await mammoth.extractRawText({ buffer });
+        blocks.push({ type: "text", text: `Contents of ${name}:\n\n` + (value || "").slice(0, 60000) });
+        sourceKind = sourceKind || "docx";
+      } else {
+        const decoded = Buffer.from(b64, "base64").toString("utf8");
+        blocks.push({ type: "text", text: `Contents of ${name}:\n\n` + decoded.slice(0, 60000) });
+        sourceKind = sourceKind || "text";
+      }
+      names.push(name);
+    }
+  } catch (e) {
+    console.error("Ingest file error:", e.message);
+    return res.status(400).json({ error: "I couldn't read one of those files. Try a different format (PDF, Word, image, or plain text)." });
+  }
+
+  blocks.push({
+    type: "text",
+    text: "Turn the material above into ONE knowledge entry for Benny, following your instructions. Respond with only the JSON object.",
+  });
+
+  let parsed;
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 2000,
+        system: [{ type: "text", text: INGEST_SYSTEM }],
+        messages: [{ role: "user", content: blocks }],
+      }),
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      console.error("Ingest API error:", r.status, t);
+      return res.status(502).json({ error: "Benny's intake is temporarily unavailable. Please try again." });
+    }
+    const d = await r.json();
+    const raw = (d.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
+    parsed = extractJson(raw);
+  } catch (e) {
+    console.error("Ingest parse error:", e.message);
+    return res.status(502).json({ error: "I couldn't process that just now. Please try again." });
+  }
+
+  const title = (parsed.title || "").trim();
+  const body = (parsed.body || "").trim();
+  const summary = (parsed.summary || "").trim();
+  const testQuestion = (parsed.test_question || "").trim();
+
+  if (!title || !body) {
+    return res.json({
+      added: false,
+      message: "I looked, but I couldn't find anything useful to teach Benny in that. Try adding a bit more detail, or a clearer document.",
+    });
+  }
+
+  let entryId;
+  try {
+    const ins = await pool.query(
+      `INSERT INTO brain_entries (title, summary, body, source_kind, source_name)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [title.slice(0, 200), summary.slice(0, 500), body.slice(0, 20000), sourceKind || "text", names.join(", ").slice(0, 300)]
+    );
+    entryId = ins.rows[0].id;
+  } catch (e) {
+    console.error("Could not save brain entry:", e.message);
+    return res.status(500).json({ error: "I understood it, but couldn't save it to the brain. Please try again." });
+  }
+
+  await loadBrainEntries();
+  rebuildSystemPrompt();
+
+  const q = testQuestion || `What can you tell me about ${title}?`;
+  let bennyAnswer = "";
+  try {
+    bennyAnswer = await askBenny(q);
+  } catch (e) {
+    console.error("Test question error:", e.message);
+  }
+
+  res.json({
+    added: true,
+    entry: { id: entryId, title, summary },
+    testQuestion: q,
+    bennyAnswer: bennyAnswer || "(Benny didn't answer the test just now, but the entry was saved and is live.)",
+  });
+});
+
+// List every brain entry for the Logs tab.
+app.get("/api/brain/entries", adminAuth, async (_req, res) => {
+  if (!pool || !dbReady) return res.json({ dbReady: false, rows: [] });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, created_at, title, summary, source_kind, source_name, length(body) AS size_chars
+       FROM brain_entries ORDER BY created_at DESC LIMIT 500`
+    );
+    res.json({ dbReady: true, rows });
+  } catch (e) {
+    console.error("Could not load brain entries:", e.message);
+    res.status(500).json({ error: "Could not load entries." });
+  }
+});
+
+// Delete a brain entry (removes the fact from Benny within seconds).
+app.delete("/api/brain/entries/:id", adminAuth, async (req, res) => {
+  if (!pool || !dbReady) return res.status(503).json({ error: "The brain log isn't available." });
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: "Bad id." });
+  try {
+    await pool.query("DELETE FROM brain_entries WHERE id = $1", [id]);
+    await loadBrainEntries();
+    rebuildSystemPrompt();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Could not delete brain entry:", e.message);
+    res.status(500).json({ error: "Could not delete that entry." });
+  }
+});
+
 // --- Static site (the employee-facing assistant) ---------------------------
 // Everything lives in one flat folder, so we serve ONLY an explicit allow-list.
 // This keeps internal files (server.js, prompt.js, knowledge-base.md,
-// admin-page.html, Dockerfile, configs) private even though they sit alongside
-// the public assets.
+// admin-page.html, brain-page.html, Dockerfile, configs) private even though
+// they sit alongside the public assets.
 const STATIC_FILES = {
   "/": "index.html",
   "/index.html": "index.html",
@@ -562,7 +857,7 @@ app.get(Object.keys(STATIC_FILES), (req, res) => {
   res.sendFile(path.join(__dirname, STATIC_FILES[req.path]));
 });
 
-// The knowledge base links PDFs as /forms/<name>.pdf, but they live at the root.
+// The knowledge base links PDFs as /forms/<n>.pdf, but they live at the root.
 app.get("/forms/:name", (req, res) => {
   if (PUBLIC_PDFS.has(req.params.name)) {
     return res.sendFile(path.join(__dirname, req.params.name));
