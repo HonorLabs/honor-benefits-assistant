@@ -13,6 +13,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "mammoth": "^1.8.0",
-    "pg": "^8.22.0"
+    "pg": "^8.22.0",
+    "word-extractor": "^1.0.4"
   }
 }
