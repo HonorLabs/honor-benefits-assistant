@@ -4,10 +4,15 @@ import path from "path";
 import { fileURLToPath } from "url";
 import pg from "pg";
 import mammoth from "mammoth";
+import WordExtractor from "word-extractor";
 import { buildSystemPrompt } from "./prompt.js";
 import { loadPackages, assembleKnowledge, isEnabled, packageSummaries } from "./packages.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Reader for legacy binary Word (.doc) files. mammoth only handles .docx, so
+// without this a .doc decodes to garbage and Benny "learns" nothing from it.
+const wordExtractor = new WordExtractor();
 
 const app = express();
 // Raised from 1mb so /brain can accept uploaded PDFs/images/docs as base64.
@@ -603,9 +608,9 @@ app.post("/api/admin/packages/:id", adminAuth, async (req, res) => {
 
 // --- Brain (teach Benny live) ----------------------------------------------
 // The /brain page lets HR add knowledge without a redeploy. It accepts typed
-// text and/or uploaded files (PDF, Word .docx, images/scans, plain text). An
-// "intake agent" turns the material into one clean knowledge entry, saves it to
-// brain_entries, rebuilds the prompt, and then asks the live Benny a test
+// text and/or uploaded files (PDF, Word .doc/.docx, images/scans, plain text).
+// An "intake agent" turns the material into one clean knowledge entry, saves it
+// to brain_entries, rebuilds the prompt, and then asks the live Benny a test
 // question so the person can see the new fact took effect. Same admin password.
 
 const INGEST_SYSTEM = `You are the knowledge intake agent for "Benny," a benefits and 401(k) assistant used by Honor Health Network employees. Someone from HR or operations is giving you material — typed notes, a PDF, a Word document, or an image/scan. Your ONLY job is to turn that material into ONE clean knowledge entry that Benny can use to answer employees, and to write a question that proves the entry works.
@@ -684,7 +689,8 @@ app.post("/api/brain/ingest", adminAuth, async (req, res) => {
 
   const blocks = [];
   let sourceKind = null;
-  const names = [];
+  const names = [];      // sources that produced usable material
+  const skipped = [];    // { name, reason } for anything we couldn't read
 
   if (hasText) {
     blocks.push({ type: "text", text: "Typed notes:\n\n" + text.slice(0, 60000) });
@@ -692,38 +698,99 @@ app.post("/api/brain/ingest", adminAuth, async (req, res) => {
     names.push("typed notes");
   }
 
-  try {
-    for (const f of fileList) {
-      const name = String(f?.name || "file");
-      const b64 = String(f?.dataBase64 || "");
-      if (!b64) continue;
-      if (b64.length > 28_000_000) {
-        return res.status(413).json({ error: `"${name}" is too large. Please keep files under about 20 MB.` });
-      }
-      const mt = guessMediaType(name, String(f?.mediaType || ""));
-      const lower = name.toLowerCase();
+  // Does a decoded string look like real text, or like binary we mis-read?
+  // Legacy .doc/.xlsx/.zip etc. decode to mostly control and replacement
+  // characters, and we must never feed that garbage to the model as if it were
+  // readable content — that is what made Benny silently "learn nothing."
+  function looksLikeText(s) {
+    if (!s || !s.trim()) return false;
+    const sample = s.slice(0, 4000);
+    let bad = 0;
+    for (let i = 0; i < sample.length; i++) {
+      const c = sample.charCodeAt(i);
+      if (c === 0xfffd) bad++; // Unicode replacement char
+      else if (c < 9 || (c > 13 && c < 32)) bad++; // control chars
+    }
+    return bad / sample.length < 0.1;
+  }
 
+  const TEXT_EXTS = [".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".log", ".rtf", ".html", ".htm", ".xml", ".yml", ".yaml"];
+
+  // Read every file on its own. A problem with one file is reported for that
+  // file specifically, and never kills the whole upload.
+  for (const f of fileList) {
+    const name = String(f?.name || "file");
+    const b64 = String(f?.dataBase64 || "");
+    if (!b64) {
+      skipped.push({ name, reason: "no file data came through — try uploading it again" });
+      continue;
+    }
+    if (b64.length > 28_000_000) {
+      return res.status(413).json({ error: `"${name}" is too large. Please keep files under about 20 MB.` });
+    }
+    const mt = guessMediaType(name, String(f?.mediaType || ""));
+    const lower = name.toLowerCase();
+    const ext = (lower.match(/\.[a-z0-9]+$/) || [""])[0];
+
+    try {
       if (mt === "application/pdf" || lower.endsWith(".pdf")) {
         blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: b64 } });
         sourceKind = sourceKind || "pdf";
+        names.push(name);
       } else if (mt.startsWith("image/")) {
         blocks.push({ type: "image", source: { type: "base64", media_type: mt, data: b64 } });
         sourceKind = sourceKind || "image";
+        names.push(name);
       } else if (lower.endsWith(".docx") || mt.includes("wordprocessingml")) {
         const buffer = Buffer.from(b64, "base64");
         const { value } = await mammoth.extractRawText({ buffer });
-        blocks.push({ type: "text", text: `Contents of ${name}:\n\n` + (value || "").slice(0, 60000) });
-        sourceKind = sourceKind || "docx";
-      } else {
+        if (!value || !value.trim()) {
+          skipped.push({ name, reason: "it's a Word file with no readable text in it — if it's a scan, save it as a PDF and upload that" });
+        } else {
+          blocks.push({ type: "text", text: `Contents of ${name}:\n\n` + value.slice(0, 60000) });
+          sourceKind = sourceKind || "docx";
+          names.push(name);
+        }
+      } else if (lower.endsWith(".doc") || lower.endsWith(".dot") || mt === "application/msword") {
+        // Legacy binary Word. mammoth can't read these; word-extractor can.
+        const buffer = Buffer.from(b64, "base64");
+        const extracted = await wordExtractor.extract(buffer);
+        const value = (extracted.getBody() || "").trim();
+        if (!value) {
+          skipped.push({ name, reason: "it's an old-format Word file with no readable text — if it's a scan, save it as a PDF and upload that" });
+        } else {
+          blocks.push({ type: "text", text: `Contents of ${name}:\n\n` + value.slice(0, 60000) });
+          sourceKind = sourceKind || "doc";
+          names.push(name);
+        }
+      } else if (TEXT_EXTS.includes(ext) || ext === "") {
         const decoded = Buffer.from(b64, "base64").toString("utf8");
-        blocks.push({ type: "text", text: `Contents of ${name}:\n\n` + decoded.slice(0, 60000) });
-        sourceKind = sourceKind || "text";
+        if (!looksLikeText(decoded)) {
+          skipped.push({ name, reason: "I couldn't find readable text in it" });
+        } else {
+          blocks.push({ type: "text", text: `Contents of ${name}:\n\n` + decoded.slice(0, 60000) });
+          sourceKind = sourceKind || "text";
+          names.push(name);
+        }
+      } else {
+        skipped.push({ name, reason: `I can't read ${ext || "that kind of"} files yet — I can read PDF, Word (.doc or .docx), images or scans, and plain text` });
       }
-      names.push(name);
+    } catch (e) {
+      console.error(`Ingest file error (${name}):`, e.message);
+      skipped.push({ name, reason: "the file looks damaged, or its contents don't match its file type" });
     }
-  } catch (e) {
-    console.error("Ingest file error:", e.message);
-    return res.status(400).json({ error: "I couldn't read one of those files. Try a different format (PDF, Word, image, or plain text)." });
+  }
+
+  // Nothing readable came through (and no typed notes either). Tell the person
+  // exactly why, file by file, instead of a vague "nothing useful."
+  if (blocks.length === 0) {
+    const detail = skipped.length
+      ? " Here's what happened: " + skipped.map((s) => `"${s.name}" — ${s.reason}`).join("; ") + "."
+      : "";
+    return res.json({
+      added: false,
+      message: "I couldn't read anything to teach Benny from that." + detail,
+    });
   }
 
   blocks.push({
@@ -753,7 +820,7 @@ app.post("/api/brain/ingest", adminAuth, async (req, res) => {
     parsed = extractJson(raw);
   } catch (e) {
     console.error("Ingest parse error:", e.message);
-    return res.status(502).json({ error: "I couldn't process that just now. Please try again." });
+    return res.status(502).json({ error: "I read the material but the intake step failed before it finished. Please try again." });
   }
 
   const title = (parsed.title || "").trim();
@@ -762,9 +829,16 @@ app.post("/api/brain/ingest", adminAuth, async (req, res) => {
   const testQuestion = (parsed.test_question || "").trim();
 
   if (!title || !body) {
+    // We DID read the material — there just wasn't anything Benny could use.
+    // Say that plainly, and still surface any files we couldn't open.
+    const detail = skipped.length
+      ? ` (I also couldn't read: ${skipped.map((s) => `"${s.name}" — ${s.reason}`).join("; ")}.)`
+      : "";
     return res.json({
       added: false,
-      message: "I looked, but I couldn't find anything useful to teach Benny in that. Try adding a bit more detail, or a clearer document.",
+      message:
+        "I read that, but I couldn't find benefits or 401(k) facts in it that Benny could use to answer employees. If it's the right document, add a sentence of context about what to capture and try again." +
+        detail,
     });
   }
 
@@ -797,6 +871,7 @@ app.post("/api/brain/ingest", adminAuth, async (req, res) => {
     entry: { id: entryId, title, summary },
     testQuestion: q,
     bennyAnswer: bennyAnswer || "(Benny didn't answer the test just now, but the entry was saved and is live.)",
+    skipped: skipped.length ? skipped : undefined,
   });
 });
 
