@@ -206,11 +206,94 @@ export function handbookContentHash(value) {
   return crypto.createHash("sha256").update(normalizeHandbookText(value), "utf8").digest("hex");
 }
 
-export function buildFullOfficeHandbookContext({ agency, sourceName, sourceDate, fullText }) {
+function recentUserText(messages, latestOnly = false) {
+  const userMessages = (Array.isArray(messages) ? messages : [])
+    .filter((message) => message?.role === "user" && typeof message.content === "string")
+    .slice(-8);
+  const selected = latestOnly ? userMessages.slice(-1) : userMessages;
+  return normalizeSearchText(selected.map((message) => message.content).join(" "));
+}
+
+export function wantsOfficeHandbookDownload(messages) {
+  const latest = recentUserText(messages, true);
+  if (!latest) return false;
+  return (
+    /\b(?:share|send|download|provide|give|open|view|access|get)\b.{0,60}\b(?:handbook|manual|document|file|copy)\b/.test(
+      latest
+    ) ||
+    /\b(?:handbook|manual)\b.{0,60}\b(?:link|download|file|copy)\b/.test(latest)
+  );
+}
+
+export function hasOfficeRoleConfirmation(messages) {
+  const text = recentUserText(messages);
+  if (!text) return false;
+  return (
+    /\b(?:i am|im|i work as|my role is|as)\s+(?:an?\s+)?(?:office|administrative|admin|human resources|hr)\s+(?:employee|staff|worker|manager|team member|team)\b/.test(
+      text
+    ) ||
+    /\b(?:i am|im|i work as|my role is)\s+(?:an?\s+)?(?:administrator|office administrator|office manager|hr manager)\b/.test(
+      text
+    ) ||
+    /\bi work (?:in|at) (?:the )?office\b/.test(text)
+  );
+}
+
+function handbookDownloadPayload(agencySlug, expires) {
+  return `${String(agencySlug || "")}:${String(expires || "")}`;
+}
+
+export function createHandbookDownloadSignature({ agencySlug, expires, secret }) {
+  if (!agencySlug || !expires || !secret) return "";
+  return crypto
+    .createHmac("sha256", String(secret))
+    .update(handbookDownloadPayload(agencySlug, expires), "utf8")
+    .digest("hex");
+}
+
+export function verifyHandbookDownloadSignature({
+  agencySlug,
+  expires,
+  signature,
+  secret,
+  now = Date.now(),
+  maxFutureSeconds = 15 * 60,
+}) {
+  const expiresNumber = Number(expires);
+  const nowSeconds = Math.floor(Number(now) / 1000);
+  if (
+    !agencySlug ||
+    !secret ||
+    !Number.isInteger(expiresNumber) ||
+    expiresNumber <= nowSeconds ||
+    expiresNumber > nowSeconds + maxFutureSeconds ||
+    !/^[a-f0-9]{64}$/i.test(String(signature || ""))
+  ) {
+    return false;
+  }
+
+  const expected = Buffer.from(
+    createHandbookDownloadSignature({ agencySlug, expires: expiresNumber, secret }),
+    "hex"
+  );
+  const provided = Buffer.from(String(signature), "hex");
+  return expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
+}
+
+export function buildFullOfficeHandbookContext({
+  agency,
+  sourceName,
+  sourceDate,
+  fullText,
+  downloadUrl = "",
+}) {
   const text = normalizeHandbookText(fullText);
   if (!agency || !sourceName || !text) return "";
   const date = sourceDate ? new Date(sourceDate) : null;
   const dateLabel = date && !Number.isNaN(date.valueOf()) ? date.toISOString().slice(0, 10) : "date not provided";
+  const sharingInstruction = downloadUrl
+    ? `The employee explicitly asked for the handbook and confirmed they are office/admin staff. Share this exact time-limited download link and explain that it expires in 10 minutes: ${downloadUrl}`
+    : `If asked to share the handbook itself, identify it by this exact source name. Do not invent a download link. If no approved link is provided above, ask the employee to confirm they are office/admin staff at the named agency.`;
 
   return `OFFICE HANDBOOK SOURCE
 The employee identified the office as ${agency.name}.
@@ -222,7 +305,7 @@ For current medical, dental, vision, retirement, premiums, or enrollment details
 Answer only what this source supports. Include important eligibility rules, deadlines, exceptions, and next steps that directly answer the question.
 If the exact rule is not present, say you could not find it in this handbook; do not fill gaps from general knowledge.
 End a supported handbook answer with: Source: ${sourceName}
-If asked to share the handbook itself, identify it by this exact source name. Do not invent a download link.
+${sharingInstruction}
 
 <office_employee_handbook>
 ${text}
