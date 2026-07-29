@@ -9,10 +9,14 @@ import { buildSystemPrompt } from "./prompt.js";
 import { loadPackages, assembleKnowledge, isEnabled, packageSummaries } from "./packages.js";
 import {
   buildFullOfficeHandbookContext,
+  createHandbookDownloadSignature,
   getOfficeAgency,
   handbookContentHash,
+  hasOfficeRoleConfirmation,
   normalizeHandbookText,
   resolveOfficeAgency,
+  verifyHandbookDownloadSignature,
+  wantsOfficeHandbookDownload,
 } from "./office-handbooks.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -29,6 +33,17 @@ app.use(express.json({ limit: "30mb" }));
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = process.env.CLAUDE_MODEL || "claude-sonnet-4-6";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const HANDBOOK_DOWNLOAD_SECRET = process.env.HANDBOOK_DOWNLOAD_SECRET || ADMIN_PASSWORD;
+const HANDBOOK_PUBLIC_BASE_URL = (
+  process.env.PUBLIC_BASE_URL || "https://benny-agent.up.railway.app"
+).replace(/\/+$/, "");
+const HANDBOOK_LINK_TTL_SECONDS = 10 * 60;
+const HANDBOOK_MAX_FILE_BYTES = 5 * 1024 * 1024;
+const HANDBOOK_MIME_TYPES = new Set([
+  "application/msword",
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
 
 // Token prices (USD per 1,000,000 tokens). Defaults are Claude Sonnet 4.6
 // ($3.00 input / $15.00 output). Override with env vars if the model or the
@@ -169,6 +184,9 @@ async function initDb() {
         enabled BOOLEAN NOT NULL DEFAULT true
       );
     `);
+    await pool.query(`ALTER TABLE office_handbooks ADD COLUMN IF NOT EXISTS file_name TEXT;`);
+    await pool.query(`ALTER TABLE office_handbooks ADD COLUMN IF NOT EXISTS mime_type TEXT;`);
+    await pool.query(`ALTER TABLE office_handbooks ADD COLUMN IF NOT EXISTS file_bytes BYTEA;`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS office_handbook_agencies (
         agency_slug TEXT PRIMARY KEY,
@@ -351,6 +369,20 @@ function parseAndStripTag(text) {
   return { clean, needsHr, topic, agency };
 }
 
+function createHandbookDownloadUrl(agencySlug) {
+  if (!HANDBOOK_DOWNLOAD_SECRET || !HANDBOOK_PUBLIC_BASE_URL) return "";
+  const expires = Math.floor(Date.now() / 1000) + HANDBOOK_LINK_TTL_SECONDS;
+  const signature = createHandbookDownloadSignature({
+    agencySlug,
+    expires,
+    secret: HANDBOOK_DOWNLOAD_SECRET,
+  });
+  if (!signature) return "";
+  return `${HANDBOOK_PUBLIC_BASE_URL}/api/office-handbooks/${encodeURIComponent(
+    agencySlug
+  )}/download?expires=${expires}&sig=${signature}`;
+}
+
 async function officeHandbookPrompt(messages) {
   const resolution = resolveOfficeAgency(messages);
   if (!resolution) return null;
@@ -377,7 +409,8 @@ async function officeHandbookPrompt(messages) {
 
   try {
     const { rows } = await pool.query(
-      `SELECT a.agency_slug, a.agency_name, h.source_name, h.source_date, h.full_text
+      `SELECT a.agency_slug, a.agency_name, h.source_name, h.source_date, h.full_text,
+              h.file_name, octet_length(h.file_bytes) AS file_size
        FROM office_handbook_agencies a
        JOIN office_handbooks h ON h.id = a.handbook_id
        WHERE a.agency_slug = $1 AND h.enabled = true
@@ -392,14 +425,28 @@ async function officeHandbookPrompt(messages) {
     }
 
     const row = rows[0];
+    const wantsDownload = wantsOfficeHandbookDownload(messages);
+    const roleConfirmed = hasOfficeRoleConfirmation(messages);
+    const downloadUrl =
+      wantsDownload && roleConfirmed && Number(row.file_size) > 0
+        ? createHandbookDownloadUrl(row.agency_slug)
+        : "";
+    const downloadRouting =
+      wantsDownload && !roleConfirmed
+        ? "\nThe employee asked for the file but has not yet confirmed they are office/admin staff. Ask for that confirmation before sharing a link."
+        : wantsDownload && roleConfirmed && !downloadUrl
+          ? "\nThe employee asked for the file, but no approved downloadable copy is available. Give the exact source name and direct them to HR."
+          : "";
     return {
-      cache: true,
-      text: buildFullOfficeHandbookContext({
-        agency: { slug: row.agency_slug, name: row.agency_name },
-        sourceName: row.source_name,
-        sourceDate: row.source_date,
-        fullText: row.full_text,
-      }),
+      cache: !downloadUrl,
+      text:
+        buildFullOfficeHandbookContext({
+          agency: { slug: row.agency_slug, name: row.agency_name },
+          sourceName: row.source_name,
+          sourceDate: row.source_date,
+          fullText: row.full_text,
+          downloadUrl,
+        }) + downloadRouting,
     };
   } catch (error) {
     console.error("Could not retrieve office handbook:", error.message);
@@ -1009,6 +1056,39 @@ app.delete("/api/brain/entries/:id", adminAuth, async (req, res) => {
 // Import a complete office employee handbook after text extraction. The
 // endpoint is intentionally admin-only and never exposes or stores the source
 // API credential. Content is deduplicated by a server-computed SHA-256 hash.
+function parseHandbookFile(body, sourceName) {
+  const base64 = String(body?.fileBase64 || "").trim();
+  if (!base64) return { fileBytes: null, fileName: null, mimeType: null };
+  if (base64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64)) {
+    return { error: "The handbook file is not valid base64." };
+  }
+
+  const fileBytes = Buffer.from(base64, "base64");
+  if (!fileBytes.length || fileBytes.length > HANDBOOK_MAX_FILE_BYTES) {
+    return { error: "The handbook file must be between 1 byte and 5 MB." };
+  }
+
+  const requestedName = String(body?.fileName || sourceName || "").trim();
+  const fileName = requestedName.split(/[\\/]/).pop().slice(0, 300);
+  const extension = path.extname(fileName).toLowerCase();
+  if (![".doc", ".docx", ".pdf"].includes(extension)) {
+    return { error: "Only PDF, DOC, and DOCX handbook files are supported." };
+  }
+  const inferredMimeType =
+    extension === ".pdf"
+      ? "application/pdf"
+      : extension === ".docx"
+        ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        : "application/msword";
+  const requestedMimeType = String(body?.mimeType || "").trim().toLowerCase();
+  const mimeType = HANDBOOK_MIME_TYPES.has(requestedMimeType) ? requestedMimeType : inferredMimeType;
+  if (!HANDBOOK_MIME_TYPES.has(mimeType)) {
+    return { error: "Only PDF, DOC, and DOCX handbook files are supported." };
+  }
+
+  return { fileBytes, fileName, mimeType };
+}
+
 app.post("/api/brain/office-handbooks/import", adminAuth, async (req, res) => {
   if (!pool || !dbReady) {
     return res.status(503).json({ error: "The database isn't connected, so office handbooks cannot be saved." });
@@ -1018,6 +1098,7 @@ app.post("/api/brain/office-handbooks/import", adminAuth, async (req, res) => {
   const sourceAttachmentId = String(req.body?.sourceAttachmentId || "").trim();
   const sourceDate = new Date(req.body?.sourceDate || "");
   const fullText = normalizeHandbookText(req.body?.text);
+  const handbookFile = parseHandbookFile(req.body, sourceName);
   const requestedAgencies = Array.isArray(req.body?.agencies) ? req.body.agencies.slice(0, 12) : [];
   const agencies = requestedAgencies
     .map((item) => getOfficeAgency(typeof item === "string" ? item : item?.slug))
@@ -1032,6 +1113,9 @@ app.post("/api/brain/office-handbooks/import", adminAuth, async (req, res) => {
   if (fullText.length > 500_000) {
     return res.status(413).json({ error: "The extracted handbook text is too large." });
   }
+  if (handbookFile.error) {
+    return res.status(400).json({ error: handbookFile.error });
+  }
 
   const contentHash = handbookContentHash(fullText);
   const client = await pool.connect();
@@ -1039,14 +1123,30 @@ app.post("/api/brain/office-handbooks/import", adminAuth, async (req, res) => {
     await client.query("BEGIN");
     let handbookId;
     let added = false;
-    const existing = await client.query(`SELECT id FROM office_handbooks WHERE content_hash = $1`, [contentHash]);
+    let fileStored = false;
+    const existing = await client.query(
+      `SELECT id, file_bytes IS NOT NULL AS has_file FROM office_handbooks WHERE content_hash = $1`,
+      [contentHash]
+    );
     if (existing.rows.length) {
       handbookId = existing.rows[0].id;
+      fileStored = existing.rows[0].has_file || Boolean(handbookFile.fileBytes);
+      if (handbookFile.fileBytes) {
+        await client.query(
+          `UPDATE office_handbooks
+           SET file_name = COALESCE(file_name, $2),
+               mime_type = COALESCE(mime_type, $3),
+               file_bytes = COALESCE(file_bytes, $4)
+           WHERE id = $1`,
+          [handbookId, handbookFile.fileName, handbookFile.mimeType, handbookFile.fileBytes]
+        );
+      }
     } else {
       const inserted = await client.query(
         `INSERT INTO office_handbooks
-           (source_date, source_name, source_attachment_id, content_hash, full_text)
-         VALUES ($1, $2, $3, $4, $5)
+           (source_date, source_name, source_attachment_id, content_hash, full_text,
+            file_name, mime_type, file_bytes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING id`,
         [
           sourceDate.toISOString(),
@@ -1054,10 +1154,14 @@ app.post("/api/brain/office-handbooks/import", adminAuth, async (req, res) => {
           sourceAttachmentId.slice(0, 100) || null,
           contentHash,
           fullText,
+          handbookFile.fileName,
+          handbookFile.mimeType,
+          handbookFile.fileBytes,
         ]
       );
       handbookId = inserted.rows[0].id;
       added = true;
+      fileStored = Boolean(handbookFile.fileBytes);
     }
 
     const mapped = [];
@@ -1090,6 +1194,8 @@ app.post("/api/brain/office-handbooks/import", adminAuth, async (req, res) => {
       mapped,
       keptNewer,
       textChars: fullText.length,
+      fileStored,
+      fileName: handbookFile.fileName,
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -1106,6 +1212,8 @@ app.get("/api/brain/office-handbooks", adminAuth, async (_req, res) => {
     const { rows } = await pool.query(
       `SELECT h.id, h.created_at, h.source_date, h.source_name,
               length(h.full_text) AS text_chars,
+              h.file_name,
+              octet_length(h.file_bytes) AS file_bytes,
               array_agg(a.agency_slug ORDER BY a.agency_slug) FILTER (WHERE a.agency_slug IS NOT NULL) AS agencies
        FROM office_handbooks h
        LEFT JOIN office_handbook_agencies a ON a.handbook_id = h.id
@@ -1117,6 +1225,68 @@ app.get("/api/brain/office-handbooks", adminAuth, async (_req, res) => {
   } catch (error) {
     console.error("Could not list office handbooks:", error.message);
     res.status(500).json({ error: "Could not load office handbooks." });
+  }
+});
+
+function handbookContentDisposition(fileName) {
+  const cleanName = String(fileName || "employee-handbook")
+    .replace(/[\r\n]/g, "")
+    .split(/[\\/]/)
+    .pop()
+    .slice(0, 300);
+  const asciiName = cleanName.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
+  const encodedName = encodeURIComponent(cleanName).replace(/['()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encodedName}`;
+}
+
+app.get("/api/office-handbooks/:agencySlug/download", async (req, res) => {
+  const agency = getOfficeAgency(req.params.agencySlug);
+  const expires = req.query.expires;
+  const signature = req.query.sig;
+  if (
+    !agency ||
+    !verifyHandbookDownloadSignature({
+      agencySlug: agency.slug,
+      expires,
+      signature,
+      secret: HANDBOOK_DOWNLOAD_SECRET,
+    })
+  ) {
+    return res.status(403).send("This handbook link is invalid or has expired.");
+  }
+  if (!pool || !dbReady) {
+    return res.status(503).send("The handbook service is temporarily unavailable.");
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT h.source_name, h.file_name, h.mime_type, h.file_bytes
+       FROM office_handbook_agencies a
+       JOIN office_handbooks h ON h.id = a.handbook_id
+       WHERE a.agency_slug = $1 AND h.enabled = true
+       LIMIT 1`,
+      [agency.slug]
+    );
+    if (!rows.length || !rows[0].file_bytes) {
+      return res.status(404).send("A downloadable copy of this handbook is not available.");
+    }
+
+    const row = rows[0];
+    const fileName = row.file_name || row.source_name || `${agency.slug}-employee-handbook`;
+    const mimeType = HANDBOOK_MIME_TYPES.has(row.mime_type) ? row.mime_type : "application/octet-stream";
+    res.set({
+      "Cache-Control": "private, no-store, max-age=0",
+      "Content-Disposition": handbookContentDisposition(fileName),
+      "Content-Length": String(row.file_bytes.length),
+      "Content-Type": mimeType,
+      "X-Content-Type-Options": "nosniff",
+    });
+    return res.send(row.file_bytes);
+  } catch (error) {
+    console.error("Could not download office handbook:", error.message);
+    return res.status(500).send("The handbook could not be downloaded.");
   }
 });
 

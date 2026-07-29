@@ -29,6 +29,13 @@ in `public/forms/` are downloadable, and the assistant links to the right one wh
 helps (for example, the hardship form for a withdrawal question). To update anything,
 edit `knowledge-base.md` and redeploy.
 
+Office employee handbooks are stored separately in Postgres and mapped to one
+or more agency slugs. Benny attaches only the handbook for the exact office
+identified in the conversation. When an employee explicitly asks for a copy
+and confirms they are office/admin staff, Benny can return a signed download
+link that expires after 10 minutes. Set `PUBLIC_BASE_URL` and a strong
+`HANDBOOK_DOWNLOAD_SECRET` in Railway before enabling handbook downloads.
+
 ## Run it locally (optional)
 
 1. Install Node 18 or newer.
@@ -55,6 +62,8 @@ edit `knowledge-base.md` and redeploy.
 - **Access control is not built yet.** Right now anyone with the URL can use it. There's a
   basic rate limit to protect your bill, but before sharing widely we should add a real
   way to gate access (company login, a shared password page, or putting it behind your
-  existing systems). That's the next decision to make.
+  existing systems). A short-lived handbook link prevents permanent public URLs and
+  agency-link tampering, but an employee's office/admin role is still self-attested in
+  chat rather than verified through company login.
 - **Costs.** You pay Anthropic per use. Sonnet 4.6 is a good default. For high volume,
   switch `CLAUDE_MODEL` to `claude-haiku-4-5-20251001` to cut cost.
