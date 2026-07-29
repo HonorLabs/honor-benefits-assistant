@@ -78,6 +78,16 @@ test("requires an explicit file request and office role confirmation before shar
   );
 });
 
+test("carries a handbook share request through the office role confirmation", () => {
+  const messages = [
+    { role: "user", content: "Can you share the VMT office handbook?" },
+    { role: "assistant", content: "Please confirm that you are office or admin staff." },
+    { role: "user", content: "Yes, I am office staff." },
+  ];
+  assert.equal(wantsOfficeHandbookDownload(messages), true);
+  assert.equal(hasOfficeRoleConfirmation(messages), true);
+});
+
 test("signs short-lived links and rejects tampering or expiration", () => {
   const secret = "unit-test-download-secret";
   const now = Date.UTC(2026, 6, 29, 12, 0, 0);
@@ -120,7 +130,7 @@ test("signs short-lived links and rejects tampering or expiration", () => {
   );
 });
 
-test("includes only the server-provided handbook download link", () => {
+test("keeps signed handbook URLs out of the model prompt", () => {
   const downloadUrl =
     "https://benny-agent.up.railway.app/api/office-handbooks/vmt_home_health/download?expires=1&sig=test";
   const context = buildFullOfficeHandbookContext({
@@ -129,7 +139,9 @@ test("includes only the server-provided handbook download link", () => {
     sourceDate: "2026-07-17T15:00:38Z",
     fullText: "Employees receive the handbook.",
     downloadUrl,
+    downloadRequested: true,
   });
-  assert.match(context, new RegExp(downloadUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(context, /expires in 10 minutes/i);
+  assert.doesNotMatch(context, new RegExp(downloadUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(context, /application will attach the exact source/i);
+  assert.match(context, /use the Source link/i);
 });

@@ -33,7 +33,9 @@ Office employee handbooks are stored separately in Postgres and mapped to one
 or more agency slugs. Benny attaches only the handbook for the exact office
 identified in the conversation. When an employee explicitly asks for a copy
 and confirms they are office/admin staff, Benny can return a signed download
-link that expires after 10 minutes. Set `PUBLIC_BASE_URL` and a strong
+link that expires after 10 minutes. For handbook-grounded answers, the exact
+handbook name on the `Source:` line also becomes that signed link after the
+employee confirms an office/admin role. Set `PUBLIC_BASE_URL` and a strong
 `HANDBOOK_DOWNLOAD_SECRET` in Railway before enabling handbook downloads.
 
 ## Run it locally (optional)

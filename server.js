@@ -428,7 +428,7 @@ async function officeHandbookPrompt(messages) {
     const wantsDownload = wantsOfficeHandbookDownload(messages);
     const roleConfirmed = hasOfficeRoleConfirmation(messages);
     const downloadUrl =
-      wantsDownload && roleConfirmed && Number(row.file_size) > 0
+      roleConfirmed && Number(row.file_size) > 0
         ? createHandbookDownloadUrl(row.agency_slug)
         : "";
     const downloadRouting =
@@ -438,7 +438,9 @@ async function officeHandbookPrompt(messages) {
           ? "\nThe employee asked for the file, but no approved downloadable copy is available. Give the exact source name and direct them to HR."
           : "";
     return {
-      cache: !downloadUrl,
+      // The signed URL is returned as structured response metadata and is not
+      // embedded in this prompt, so the handbook context remains cacheable.
+      cache: true,
       text:
         buildFullOfficeHandbookContext({
           agency: { slug: row.agency_slug, name: row.agency_name },
@@ -446,7 +448,15 @@ async function officeHandbookPrompt(messages) {
           sourceDate: row.source_date,
           fullText: row.full_text,
           downloadUrl,
+          downloadRequested: wantsDownload,
         }) + downloadRouting,
+      sourceDocument: downloadUrl
+        ? {
+            name: row.source_name,
+            url: downloadUrl,
+            expiresInSeconds: HANDBOOK_LINK_TTL_SECONDS,
+          }
+        : null,
     };
   } catch (error) {
     console.error("Could not retrieve office handbook:", error.message);
@@ -543,7 +553,10 @@ app.post("/api/chat", async (req, res) => {
       cacheWriteTokens: usage.cache_creation_input_tokens || 0,
     });
 
-    res.json({ reply: finalReply });
+    res.json({
+      reply: finalReply,
+      sourceDocument: handbookPrompt?.sourceDocument || null,
+    });
   } catch (err) {
     console.error("Chat handler error:", err);
     res.status(500).json({ error: "Something went wrong. Please try again." });
