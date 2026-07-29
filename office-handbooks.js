@@ -214,20 +214,16 @@ function recentUserText(messages, latestOnly = false) {
   return normalizeSearchText(selected.map((message) => message.content).join(" "));
 }
 
-export function wantsOfficeHandbookDownload(messages) {
-  const latest = recentUserText(messages, true);
-  if (!latest) return false;
+function matchesOfficeHandbookDownloadRequest(text) {
   return (
     /\b(?:share|send|download|provide|give|open|view|access|get)\b.{0,60}\b(?:handbook|manual|document|file|copy)\b/.test(
-      latest
+      text
     ) ||
-    /\b(?:handbook|manual)\b.{0,60}\b(?:link|download|file|copy)\b/.test(latest)
+    /\b(?:handbook|manual)\b.{0,60}\b(?:link|download|file|copy)\b/.test(text)
   );
 }
 
-export function hasOfficeRoleConfirmation(messages) {
-  const text = recentUserText(messages);
-  if (!text) return false;
+function matchesOfficeRoleConfirmation(text) {
   return (
     /\b(?:i am|im|i work as|my role is|as)\s+(?:an?\s+)?(?:office|administrative|admin|human resources|hr)\s+(?:employee|staff|worker|manager|team member|team)\b/.test(
       text
@@ -237,6 +233,26 @@ export function hasOfficeRoleConfirmation(messages) {
     ) ||
     /\bi work (?:in|at) (?:the )?office\b/.test(text)
   );
+}
+
+export function wantsOfficeHandbookDownload(messages) {
+  const userMessages = (Array.isArray(messages) ? messages : [])
+    .filter((message) => message?.role === "user" && typeof message.content === "string")
+    .slice(-8)
+    .map((message) => normalizeSearchText(message.content));
+  const latest = userMessages.at(-1) || "";
+  if (!latest) return false;
+  if (matchesOfficeHandbookDownloadRequest(latest)) return true;
+
+  // Carry a pending share request through Benny's one-question role check.
+  const previous = userMessages.at(-2) || "";
+  return matchesOfficeRoleConfirmation(latest) && matchesOfficeHandbookDownloadRequest(previous);
+}
+
+export function hasOfficeRoleConfirmation(messages) {
+  const text = recentUserText(messages);
+  if (!text) return false;
+  return matchesOfficeRoleConfirmation(text);
 }
 
 function handbookDownloadPayload(agencySlug, expires) {
@@ -286,13 +302,16 @@ export function buildFullOfficeHandbookContext({
   sourceDate,
   fullText,
   downloadUrl = "",
+  downloadRequested = false,
 }) {
   const text = normalizeHandbookText(fullText);
   if (!agency || !sourceName || !text) return "";
   const date = sourceDate ? new Date(sourceDate) : null;
   const dateLabel = date && !Number.isNaN(date.valueOf()) ? date.toISOString().slice(0, 10) : "date not provided";
-  const sharingInstruction = downloadUrl
-    ? `The employee explicitly asked for the handbook and confirmed they are office/admin staff. Share this exact time-limited download link and explain that it expires in 10 minutes: ${downloadUrl}`
+  const sharingInstruction = downloadUrl && downloadRequested
+    ? "The employee explicitly asked for the handbook and confirmed they are office/admin staff. The application will attach the exact source as a time-limited link. Tell them to use the Source link below; do not print or invent a URL."
+    : downloadUrl
+      ? "The application will turn the exact Source name into a time-limited document link. Do not add or mention a separate URL unless the employee asks for the handbook."
     : `If asked to share the handbook itself, identify it by this exact source name. Do not invent a download link. If no approved link is provided above, ask the employee to confirm they are office/admin staff at the named agency.`;
 
   return `OFFICE HANDBOOK SOURCE

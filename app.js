@@ -71,15 +71,46 @@ function escapeHtml(s) {
   return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function safeSourceDocument(sourceDocument) {
+  if (!sourceDocument?.name || !sourceDocument?.url) return null;
+  try {
+    const url = new URL(sourceDocument.url, window.location.origin);
+    const isHandbookDownload =
+      url.origin === window.location.origin &&
+      /^\/api\/office-handbooks\/[^/]+\/download$/.test(url.pathname);
+    if (!isHandbookDownload) return null;
+    return {
+      name: String(sourceDocument.name).slice(0, 300),
+      url: url.href,
+    };
+  } catch {
+    return null;
+  }
+}
+
 // Turn URLs, form paths, emails, and phone numbers into clickable links.
 // Everything is escaped first, so this is safe to set as innerHTML.
-function renderRich(text) {
+function renderRich(text, sourceDocument = null) {
+  const source = safeSourceDocument(sourceDocument);
+  const sourceToken = "__BENNY_SIGNED_HANDBOOK_SOURCE__";
+  let richText = text;
+  if (source) {
+    const sourceLine = new RegExp(`Source:\\s*${escapeRegExp(source.name)}`, "i");
+    richText = sourceLine.test(richText)
+      ? richText.replace(sourceLine, `Source: ${sourceToken}`)
+      : `${richText.trim()}\n\nSource: ${sourceToken}`;
+  }
+
   const pattern = /(https?:\/\/[^\s<]+)|(\/forms\/[A-Za-z0-9_\-]+\.pdf)|([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})|(\(\d{3}\)\s?\d{3}-\d{4}|\b\d{3}-\d{3}-\d{4}\b)/g;
   let out = "";
   let last = 0;
   let m;
-  while ((m = pattern.exec(text))) {
-    out += escapeHtml(text.slice(last, m.index));
+  while ((m = pattern.exec(richText))) {
+    out += escapeHtml(richText.slice(last, m.index));
     const token = m[0];
     if (m[1]) {
       out += `<a href="${escapeHtml(token)}" target="_blank" rel="noopener noreferrer">${escapeHtml(token)}</a>`;
@@ -93,7 +124,13 @@ function renderRich(text) {
     }
     last = m.index + token.length;
   }
-  out += escapeHtml(text.slice(last));
+  out += escapeHtml(richText.slice(last));
+  if (source) {
+    out = out.replace(
+      sourceToken,
+      `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer" title="Download this source document (link expires in 10 minutes)">${escapeHtml(source.name)}</a>`
+    );
+  }
   return out;
 }
 
@@ -101,7 +138,7 @@ function scrollToBottom() {
   scrollEl.scrollTop = scrollEl.scrollHeight;
 }
 
-function addBubble(role, text) {
+function addBubble(role, text, sourceDocument = null) {
   if (emptyEl) emptyEl.classList.add("hidden");
   const row = document.createElement("div");
   row.className = "row" + (role === "user" ? " user" : "");
@@ -109,7 +146,7 @@ function addBubble(role, text) {
   const bubble = document.createElement("div");
   bubble.className = "bubble " + bubbleClass;
   if (role === "assistant") {
-    bubble.innerHTML = renderRich(text); // clickable links in answers
+    bubble.innerHTML = renderRich(text, sourceDocument); // clickable links in answers
   } else {
     bubble.textContent = text; // user + error stay plain
   }
@@ -162,7 +199,7 @@ async function send(text) {
     if (!res.ok) {
       addBubble("error", data.error || "Something went wrong. Please try again.");
     } else {
-      addBubble("assistant", data.reply);
+      addBubble("assistant", data.reply, data.sourceDocument);
       history.push({ role: "assistant", content: data.reply });
     }
   } catch (err) {
