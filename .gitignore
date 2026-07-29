@@ -1,0 +1,4 @@
+node_modules/
+.env
+.railway/
+npm-debug.log*
