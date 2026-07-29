@@ -7,6 +7,13 @@ import mammoth from "mammoth";
 import WordExtractor from "word-extractor";
 import { buildSystemPrompt } from "./prompt.js";
 import { loadPackages, assembleKnowledge, isEnabled, packageSummaries } from "./packages.js";
+import {
+  buildFullOfficeHandbookContext,
+  getOfficeAgency,
+  handbookContentHash,
+  normalizeHandbookText,
+  resolveOfficeAgency,
+} from "./office-handbooks.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -147,6 +154,32 @@ async function initDb() {
       );
     `);
     await pool.query(`CREATE INDEX IF NOT EXISTS brain_entries_created_at_idx ON brain_entries (created_at);`);
+    // Complete office employee handbooks live in Postgres rather than the
+    // global prompt. Only the handbook matching the agency named in the chat
+    // is attached to that request. Hash uniqueness prevents duplicate uploads.
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS office_handbooks (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        source_date TIMESTAMPTZ NOT NULL,
+        source_name TEXT NOT NULL,
+        source_attachment_id TEXT,
+        content_hash TEXT NOT NULL UNIQUE,
+        full_text TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT true
+      );
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS office_handbook_agencies (
+        agency_slug TEXT PRIMARY KEY,
+        agency_name TEXT NOT NULL,
+        handbook_id BIGINT NOT NULL REFERENCES office_handbooks(id) ON DELETE CASCADE,
+        source_date TIMESTAMPTZ NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS office_handbook_agencies_handbook_idx
+      ON office_handbook_agencies (handbook_id);`);
     dbReady = true;
     await loadPackageState();
     await loadBrainEntries();
@@ -318,6 +351,65 @@ function parseAndStripTag(text) {
   return { clean, needsHr, topic, agency };
 }
 
+async function officeHandbookPrompt(messages) {
+  const resolution = resolveOfficeAgency(messages);
+  if (!resolution) return null;
+
+  if (resolution.ambiguous) {
+    const choices = resolution.candidates?.map((agency) => agency.name).join(" or ");
+    return {
+      cache: false,
+      text:
+        "OFFICE HANDBOOK ROUTING\n" +
+        (choices
+          ? `The office name in the conversation could mean ${choices}. Ask the employee which state or exact office they mean before answering from a handbook.`
+          : "The employee asked about another office but did not name it. Ask for the exact agency before answering from an office handbook.") +
+        "\nDo not use the previous office's handbook for this question.",
+    };
+  }
+
+  if (!pool || !dbReady) {
+    return {
+      cache: false,
+      text: `OFFICE HANDBOOK ROUTING\nThe employee named ${resolution.agency.name}, but office handbook storage is unavailable. Do not guess or use another agency's policy.`,
+    };
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `SELECT a.agency_slug, a.agency_name, h.source_name, h.source_date, h.full_text
+       FROM office_handbook_agencies a
+       JOIN office_handbooks h ON h.id = a.handbook_id
+       WHERE a.agency_slug = $1 AND h.enabled = true
+       LIMIT 1`,
+      [resolution.agency.slug]
+    );
+    if (!rows.length) {
+      return {
+        cache: false,
+        text: `OFFICE HANDBOOK ROUTING\nThe employee named ${resolution.agency.name}, but no approved office handbook is loaded for that agency. Say you cannot verify the office policy and do not use another agency's handbook.`,
+      };
+    }
+
+    const row = rows[0];
+    return {
+      cache: true,
+      text: buildFullOfficeHandbookContext({
+        agency: { slug: row.agency_slug, name: row.agency_name },
+        sourceName: row.source_name,
+        sourceDate: row.source_date,
+        fullText: row.full_text,
+      }),
+    };
+  } catch (error) {
+    console.error("Could not retrieve office handbook:", error.message);
+    return {
+      cache: false,
+      text: `OFFICE HANDBOOK ROUTING\nThe employee named ${resolution.agency.name}, but the office handbook could not be retrieved. Do not guess or use another agency's policy.`,
+    };
+  }
+}
+
 // --- Chat endpoint ---------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
@@ -346,6 +438,14 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "No question received." });
     }
 
+    const handbookPrompt = await officeHandbookPrompt(safeMessages);
+    const system = [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }];
+    if (handbookPrompt?.text) {
+      const block = { type: "text", text: handbookPrompt.text };
+      if (handbookPrompt.cache) block.cache_control = { type: "ephemeral" };
+      system.push(block);
+    }
+
     const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -359,7 +459,7 @@ app.post("/api/chat", async (req, res) => {
         // Cache the system prompt (persona + knowledge base). It's identical on
         // every request, so after the first call Claude reads it from cache at
         // ~1/10 the input price instead of re-charging the full ~8k tokens.
-        system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+        system,
         messages: safeMessages,
       }),
     });
@@ -903,6 +1003,120 @@ app.delete("/api/brain/entries/:id", adminAuth, async (req, res) => {
   } catch (e) {
     console.error("Could not delete brain entry:", e.message);
     res.status(500).json({ error: "Could not delete that entry." });
+  }
+});
+
+// Import a complete office employee handbook after text extraction. The
+// endpoint is intentionally admin-only and never exposes or stores the source
+// API credential. Content is deduplicated by a server-computed SHA-256 hash.
+app.post("/api/brain/office-handbooks/import", adminAuth, async (req, res) => {
+  if (!pool || !dbReady) {
+    return res.status(503).json({ error: "The database isn't connected, so office handbooks cannot be saved." });
+  }
+
+  const sourceName = String(req.body?.sourceName || "").trim();
+  const sourceAttachmentId = String(req.body?.sourceAttachmentId || "").trim();
+  const sourceDate = new Date(req.body?.sourceDate || "");
+  const fullText = normalizeHandbookText(req.body?.text);
+  const requestedAgencies = Array.isArray(req.body?.agencies) ? req.body.agencies.slice(0, 12) : [];
+  const agencies = requestedAgencies
+    .map((item) => getOfficeAgency(typeof item === "string" ? item : item?.slug))
+    .filter(Boolean);
+  const uniqueAgencies = [...new Map(agencies.map((agency) => [agency.slug, agency])).values()];
+
+  if (!sourceName || Number.isNaN(sourceDate.valueOf()) || fullText.length < 500 || !uniqueAgencies.length) {
+    return res.status(400).json({
+      error: "A source name, valid source date, readable handbook text, and at least one recognized agency are required.",
+    });
+  }
+  if (fullText.length > 500_000) {
+    return res.status(413).json({ error: "The extracted handbook text is too large." });
+  }
+
+  const contentHash = handbookContentHash(fullText);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    let handbookId;
+    let added = false;
+    const existing = await client.query(`SELECT id FROM office_handbooks WHERE content_hash = $1`, [contentHash]);
+    if (existing.rows.length) {
+      handbookId = existing.rows[0].id;
+    } else {
+      const inserted = await client.query(
+        `INSERT INTO office_handbooks
+           (source_date, source_name, source_attachment_id, content_hash, full_text)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id`,
+        [
+          sourceDate.toISOString(),
+          sourceName.slice(0, 300),
+          sourceAttachmentId.slice(0, 100) || null,
+          contentHash,
+          fullText,
+        ]
+      );
+      handbookId = inserted.rows[0].id;
+      added = true;
+    }
+
+    const mapped = [];
+    const keptNewer = [];
+    for (const agency of uniqueAgencies) {
+      const result = await client.query(
+        `INSERT INTO office_handbook_agencies
+           (agency_slug, agency_name, handbook_id, source_date, updated_at)
+         VALUES ($1, $2, $3, $4, now())
+         ON CONFLICT (agency_slug) DO UPDATE SET
+           agency_name = EXCLUDED.agency_name,
+           handbook_id = EXCLUDED.handbook_id,
+           source_date = EXCLUDED.source_date,
+           updated_at = now()
+         WHERE EXCLUDED.source_date >= office_handbook_agencies.source_date
+         RETURNING agency_slug`,
+        [agency.slug, agency.name, handbookId, sourceDate.toISOString()]
+      );
+      if (result.rows.length) mapped.push(agency.slug);
+      else keptNewer.push(agency.slug);
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      ok: true,
+      added,
+      duplicate: !added,
+      sourceName,
+      handbookId,
+      mapped,
+      keptNewer,
+      textChars: fullText.length,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Could not import office handbook:", error.message);
+    res.status(500).json({ error: "The office handbook import failed." });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/brain/office-handbooks", adminAuth, async (_req, res) => {
+  if (!pool || !dbReady) return res.json({ dbReady: false, rows: [] });
+  try {
+    const { rows } = await pool.query(
+      `SELECT h.id, h.created_at, h.source_date, h.source_name,
+              length(h.full_text) AS text_chars,
+              array_agg(a.agency_slug ORDER BY a.agency_slug) FILTER (WHERE a.agency_slug IS NOT NULL) AS agencies
+       FROM office_handbooks h
+       LEFT JOIN office_handbook_agencies a ON a.handbook_id = h.id
+       WHERE h.enabled = true
+       GROUP BY h.id
+       ORDER BY h.source_date DESC, h.source_name`
+    );
+    res.json({ dbReady: true, rows });
+  } catch (error) {
+    console.error("Could not list office handbooks:", error.message);
+    res.status(500).json({ error: "Could not load office handbooks." });
   }
 });
 
