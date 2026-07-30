@@ -31,11 +31,10 @@ edit `knowledge-base.md` and redeploy.
 
 Office employee handbooks are stored separately in Postgres and mapped to one
 or more agency slugs. Benny attaches only the handbook for the exact office
-identified in the conversation. When an employee explicitly asks for a copy
-and confirms they are office/admin staff, Benny can return a signed download
-link that expires after 10 minutes. For handbook-grounded answers, the exact
-handbook name on the `Source:` line also becomes that signed link after the
-employee confirms an office/admin role. Set `PUBLIC_BASE_URL` and a strong
+identified in the conversation. When an approved original file is available,
+the exact handbook name on a grounded answer's `Source:` line becomes a signed
+download link that expires after 10 minutes. The same link is returned when an
+employee explicitly asks for the handbook. Set `PUBLIC_BASE_URL` and a strong
 `HANDBOOK_DOWNLOAD_SECRET` in Railway before enabling handbook downloads.
 
 ## Run it locally (optional)
@@ -65,7 +64,6 @@ employee confirms an office/admin role. Set `PUBLIC_BASE_URL` and a strong
   basic rate limit to protect your bill, but before sharing widely we should add a real
   way to gate access (company login, a shared password page, or putting it behind your
   existing systems). A short-lived handbook link prevents permanent public URLs and
-  agency-link tampering, but an employee's office/admin role is still self-attested in
-  chat rather than verified through company login.
+  agency-link tampering, but it does not verify the employee's identity or authorization.
 - **Costs.** You pay Anthropic per use. Sonnet 4.6 is a good default. For high volume,
   switch `CLAUDE_MODEL` to `claude-haiku-4-5-20251001` to cut cost.
