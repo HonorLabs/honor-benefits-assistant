@@ -1311,6 +1311,7 @@ const STATIC_FILES = {
   "/app.js": "app.js",
   "/honor-health-logo.jpg": "honor-health-logo.jpg",
   "/assistant-avatar.png": "assistant-avatar.png",
+  "/benny-favicon-transparent.png": "benny-favicon-transparent.png",
   "/benny.png": "benny.png",
 };
 const PUBLIC_PDFS = new Set([
