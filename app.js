@@ -3,8 +3,9 @@ const GREETING = "Hey, I'm Benny! I'm your handy Honor Benefits agent. Is there 
 const STARTERS = [
   "How does the 401(k) match work?",
   "When can I get health insurance?",
-  "How do I enroll?",
-  "Can I change my plan mid-year?",
+  "How can I get some help with a Smartsheet?",
+  "What is the company policy on Casual Fridays?",
+  "Where can I find training material?",
 ];
 
 const scrollEl = document.getElementById("scroll");
