@@ -12,7 +12,6 @@ import {
   createHandbookDownloadSignature,
   getOfficeAgency,
   handbookContentHash,
-  hasOfficeRoleConfirmation,
   normalizeHandbookText,
   resolveOfficeAgency,
   verifyHandbookDownloadSignature,
@@ -426,17 +425,14 @@ async function officeHandbookPrompt(messages) {
 
     const row = rows[0];
     const wantsDownload = wantsOfficeHandbookDownload(messages);
-    const roleConfirmed = hasOfficeRoleConfirmation(messages);
     const downloadUrl =
-      roleConfirmed && Number(row.file_size) > 0
+      Number(row.file_size) > 0
         ? createHandbookDownloadUrl(row.agency_slug)
         : "";
     const downloadRouting =
-      wantsDownload && !roleConfirmed
-        ? "\nThe employee asked for the file but has not yet confirmed they are office/admin staff. Ask for that confirmation before sharing a link."
-        : wantsDownload && roleConfirmed && !downloadUrl
-          ? "\nThe employee asked for the file, but no approved downloadable copy is available. Give the exact source name and direct them to HR."
-          : "";
+      wantsDownload && !downloadUrl
+        ? "\nThe employee asked for the file, but no approved downloadable copy is available. Give the exact source name and direct them to HR."
+        : "";
     return {
       // The signed URL is returned as structured response metadata and is not
       // embedded in this prompt, so the handbook context remains cacheable.

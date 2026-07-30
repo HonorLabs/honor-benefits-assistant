@@ -216,7 +216,7 @@ function recentUserText(messages, latestOnly = false) {
 
 function matchesOfficeHandbookDownloadRequest(text) {
   return (
-    /\b(?:share|send|download|provide|give|open|view|access|get)\b.{0,60}\b(?:handbook|manual|document|file|copy)\b/.test(
+    /\b(?:share|send|download|provide|give|open|view|access|get|see|read|have|know)\b.{0,60}\b(?:handbook|manual|document|file|copy)\b/.test(
       text
     ) ||
     /\b(?:handbook|manual)\b.{0,60}\b(?:link|download|file|copy)\b/.test(text)
@@ -309,10 +309,10 @@ export function buildFullOfficeHandbookContext({
   const date = sourceDate ? new Date(sourceDate) : null;
   const dateLabel = date && !Number.isNaN(date.valueOf()) ? date.toISOString().slice(0, 10) : "date not provided";
   const sharingInstruction = downloadUrl && downloadRequested
-    ? "The employee explicitly asked for the handbook and confirmed they are office/admin staff. The application will attach the exact source as a time-limited link. Tell them to use the Source link below; do not print or invent a URL."
+    ? "The employee explicitly asked for the handbook. The application will attach the exact source as a time-limited link. Tell them to use the Source link below; do not print or invent a URL."
     : downloadUrl
       ? "The application will turn the exact Source name into a time-limited document link. Do not add or mention a separate URL unless the employee asks for the handbook."
-    : `If asked to share the handbook itself, identify it by this exact source name. Do not invent a download link. If no approved link is provided above, ask the employee to confirm they are office/admin staff at the named agency.`;
+      : "If asked to share the handbook itself, identify it by this exact source name. Do not invent a download link. If no approved link is available, say the file cannot be downloaded here and direct the employee to HR.";
 
   return `OFFICE HANDBOOK SOURCE
 The employee identified the office as ${agency.name}.

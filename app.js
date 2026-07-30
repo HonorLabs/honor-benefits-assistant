@@ -99,7 +99,10 @@ function renderRich(text, sourceDocument = null) {
   const sourceToken = "__BENNY_SIGNED_HANDBOOK_SOURCE__";
   let richText = text;
   if (source) {
-    const sourceLine = new RegExp(`Source:\\s*${escapeRegExp(source.name)}`, "i");
+    const sourceLine = new RegExp(
+      `(?:\\*{1,2})?Source:\\s*${escapeRegExp(source.name)}(?:\\*{1,2})?`,
+      "i"
+    );
     richText = sourceLine.test(richText)
       ? richText.replace(sourceLine, `Source: ${sourceToken}`)
       : `${richText.trim()}\n\nSource: ${sourceToken}`;

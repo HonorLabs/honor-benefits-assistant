@@ -60,7 +60,7 @@ test("formats a complete handbook for request-time cached grounding", () => {
   assert.match(context, /Source: CPNC Office Employee Handbook 2026\.doc/);
 });
 
-test("requires an explicit file request and office role confirmation before sharing", () => {
+test("recognizes explicit handbook requests and office role statements", () => {
   const messages = [
     { role: "user", content: "I am an office employee at VMT Home Health Agency." },
     { role: "assistant", content: "How can I help?" },
@@ -75,6 +75,10 @@ test("requires an explicit file request and office role confirmation before shar
   assert.equal(
     hasOfficeRoleConfirmation([{ role: "user", content: "Can you share the VMT office handbook?" }]),
     false
+  );
+  assert.equal(
+    wantsOfficeHandbookDownload([{ role: "user", content: "Can I know the handbook?" }]),
+    true
   );
 });
 
